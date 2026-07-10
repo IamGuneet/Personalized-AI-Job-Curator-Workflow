@@ -1,0 +1,174 @@
+// ====================== CONFIG — edit this section ======================
+
+const CONFIG = {
+  // Where the digest gets sent (can be the same as your Gmail address)
+  DIGEST_TO_EMAIL: "<example@gmail.com>",
+
+  // Your free Gemini API key from https://aistudio.google.com/apikey
+  GEMINI_API_KEY: "<API KEY HERE>",
+
+  // Plain-English description of what you want. The AI uses this to filter/rank.
+  PREFERENCES: `
+	Example:
+    I want remote , Hyderabad ,Bengluru based data analyst, data engineer ,business analyst, reporting analyst, operational analyst
+    roles prefreably internships, apprenticeship that can convert to full time , no unpaid role,
+    0-4 years experince, sql python power bi etl big data hadoop spark airflow dag cloud a plus
+    exclude senior/lead/manager roles requiring a specific degree 
+    Here's my background
+    Bacherlors of Technology in Computer Science Specialization in Data Science Graduate of year 2026 ,
+    6 month internship experince as summer intern at a starup where wokred with python automation scripts , prompt engineering and surface level rag project,
+    currently working as a data analyst under the job title MIS analyst since June , working with advance excel , power bi data modelling business understanding , python and sql.
+    also actively learning azure cloud and data engineering concepts .......
+  `,
+
+  // Hour of day (24h, in your script's timezone) to send the digest
+  SEND_HOUR: 8,
+
+  // How many days back to look for LinkedIn alert emails (1 = just today's)
+  LOOKBACK_DAYS: 1,
+};
+
+// ====================== One-time setup ======================
+
+function setup() {
+  // Remove any existing triggers for main() to avoid duplicates
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === "main") ScriptApp.deleteTrigger(t);
+  });
+
+  ScriptApp.newTrigger("main")
+    .timeBased()
+    .everyDays(1)
+    .atHour(CONFIG.SEND_HOUR)
+    .create();
+
+  Logger.log("Daily trigger created. You're all set — main() will run every day at hour " + CONFIG.SEND_HOUR + ".");
+}
+
+// ====================== Main workflow ======================
+
+function main() {
+  const jobs = extractJobsFromLinkedInEmails();
+
+  if (jobs.length === 0) {
+    Logger.log("No LinkedIn job alert emails found in the lookback window. Nothing sent.");
+    return;
+  }
+
+  const curated = curateJobsWithAI(jobs);
+  sendDigestEmail(curated, jobs.length);
+}
+
+// ====================== Step 1: pull jobs out of Gmail ======================
+
+function extractJobsFromLinkedInEmails() {
+  const query = `from:(jobalerts-noreply@linkedin.com) newer_than:${CONFIG.LOOKBACK_DAYS}d`;
+  const threads = GmailApp.search(query);
+  const jobs = [];
+
+  threads.forEach(thread => {
+    thread.getMessages().forEach(msg => {
+      const body = msg.getBody(); // HTML body
+      jobs.push(...parseJobsFromHtml(body));
+    });
+  });
+
+  // De-duplicate by link
+  const seen = new Set();
+  return jobs.filter(j => {
+    if (seen.has(j.link)) return false;
+    seen.add(j.link);
+    return true;
+  });
+}
+
+function parseJobsFromHtml(html) {
+  const jobs = [];
+  // LinkedIn alert emails contain job links like:
+  // https://www.linkedin.com/comm/jobs/view/12345678/?...
+  const linkRegex = /<a[^>]+href="(https:\/\/www\.linkedin\.com\/comm\/jobs\/view\/[^"]+)"[^>]*>(.*?)<\/a>/gis;
+  let match;
+  while ((match = linkRegex.exec(html)) !== null) {
+    const rawLink = match[1].replace(/&amp;/g, "&");
+    const rawText = stripHtml(match[2]).trim();
+    if (rawText.length > 3 && !jobs.some(j => j.link === rawLink)) {
+      jobs.push({ title: rawText, link: rawLink });
+    }
+  }
+  return jobs;
+}
+
+function stripHtml(html) {
+  return html.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+}
+
+// ====================== Step 2: AI filter/rank ======================
+
+function curateJobsWithAI(jobs) {
+  const jobListText = jobs
+    .map((j, i) => `${i + 1}. ${j.title} | LINK: ${j.link}`)
+    .join("\n");
+
+  const prompt = `
+You are helping curate a daily job digest. Here are today's raw job listings
+pulled from LinkedIn alert emails (title text may be messy/truncated):
+
+${jobListText}
+
+My preferences:
+${CONFIG.PREFERENCES}
+
+Return ONLY a JSON array (no markdown fences, no commentary) of the jobs that
+match my preferences, best matches first. Each item must be:
+{"title": "...", "link": "...", "why": "one short sentence on why this fits"}
+If none match well, return an empty array [].
+`;
+
+  const response = UrlFetchApp.fetch(
+    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=" +
+      CONFIG.GEMINI_API_KEY,
+    {
+      method: "post",
+      contentType: "application/json",
+      payload: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+      }),
+      muteHttpExceptions: true,
+    }
+  );
+
+  const data = JSON.parse(response.getContentText());
+  let text = data?.candidates?.[0]?.content?.parts?.[0]?.text || "[]";
+  text = text.replace(/```json|```/g, "").trim();
+
+  try {
+    return JSON.parse(text);
+  } catch (e) {
+    Logger.log("Could not parse AI response, falling back to raw list. Raw: " + text);
+    return jobs.map(j => ({ title: j.title, link: j.link, why: "" }));
+  }
+}
+
+// ====================== Step 3: send the digest ======================
+
+function sendDigestEmail(curatedJobs, totalFound) {
+  const dateStr = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "MMM d, yyyy");
+
+  let html = `<h2>Your LinkedIn Job Digest — ${dateStr}</h2>`;
+  html += `<p>${totalFound} job(s) found in today's alerts, ${curatedJobs.length} matched your preferences.</p>`;
+
+  if (curatedJobs.length === 0) {
+    html += `<p>No strong matches today.</p>`;
+  } else {
+    html += "<ol>";
+    curatedJobs.forEach(j => {
+      html += `<li><a href="${j.link}">${j.title}</a>`;
+      if (j.why) html += `<br><small>${j.why}</small>`;
+      html += `</li><br>`;
+    });
+    html += "</ol>";
+  }
+
+  GmailApp.sendEmail(CONFIG.DIGEST_TO_EMAIL, `Job Digest — ${dateStr}`, "", { htmlBody: html });
+  Logger.log("Digest sent to " + CONFIG.DIGEST_TO_EMAIL);
+}
